@@ -1,15 +1,19 @@
+import atexit
 import collections
 import gzip
 import http.client
 import json
 import logging
 import math
+import os
+import socket
 import sys
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
+import weakref
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -190,7 +194,8 @@ class _Sender:
     def __init__(self, url: str, key: str, *, flush_interval: float = 2.0,
                  batch_size: int = 500, queue_size: int = 10000,
                  timeout: float = 10.0, max_body: int = 900_000,
-                 backoff_start: float = 1.0, backoff_cap: float = 30.0):
+                 backoff_start: float = 1.0, backoff_cap: float = 30.0,
+                 queue_bytes: int = 16 * 1024 * 1024):
         self._url = _endpoint(url)
         self._key = key
         self._flush_interval = flush_interval
@@ -200,6 +205,7 @@ class _Sender:
         self._max_body = max_body
         self._backoff_start = backoff_start
         self._backoff_cap = backoff_cap
+        self._queue_bytes = queue_bytes
         self.dropped = 0
         self.stopped = False
         self._last_warn = None
@@ -209,11 +215,13 @@ class _Sender:
         """Fresh queue, lock and (no) thread. Also used in a forked child."""
         self._cond = threading.Condition()
         self._queue = collections.deque()
+        self._queued = 0
         self._oldest = 0.0
         self._inflight = False
         self._flush_now = False
         self._closed = False
         self._thread = None
+        _all_senders.add(self)
 
     # -- callers -----------------------------------------------------------
 
@@ -225,12 +233,17 @@ class _Sender:
         with self._cond:
             if self._closed or self.stopped:
                 return
-            if len(self._queue) >= self._queue_size:
-                self._queue.popleft()
+            if len(raw) + 2 > self._max_body:
+                self.dropped += 1
+                return
+            while self._queue and (len(self._queue) >= self._queue_size
+                                   or self._queued + len(raw) > self._queue_bytes):
+                self._queued -= len(self._queue.popleft())
                 self.dropped += 1
             if not self._queue:
                 self._oldest = time.monotonic()
             self._queue.append(raw)
+            self._queued += len(raw)
             if self._thread is None:
                 self._thread = threading.Thread(
                     target=self._run, name="logdog-sender", daemon=True
@@ -260,6 +273,7 @@ class _Sender:
             self._closed = True
             self.dropped += len(self._queue)
             self._queue.clear()
+            self._queued = 0
             self._cond.notify_all()
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -301,6 +315,7 @@ class _Sender:
             if batch and size + n > self._max_body:
                 break
             batch.append(self._queue.popleft())
+            self._queued -= n - 1
             size += n
         return batch
 
@@ -349,6 +364,7 @@ class _Sender:
                     self.stopped = True
                     self.dropped += len(self._queue)
                     self._queue.clear()
+                    self._queued = 0
                 self.dropped += len(batch)
                 self._warn("401 %s: the API key was refused; sending is off"
                            % (error or ""))
@@ -367,7 +383,7 @@ class _Sender:
             "User-Agent": "logdog-python/" + __version__,
         })
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with _opener.open(req, timeout=self._timeout) as resp:
                 return resp.status, resp.headers, _json_body(resp.read(65536))
         except urllib.error.HTTPError as e:
             try:
@@ -389,6 +405,26 @@ class _Sender:
             pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: following one would send the API key to another URL."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+_all_senders = weakref.WeakSet()
+
+
+def _after_fork_in_child():
+    for sender in list(_all_senders):
+        sender._reset()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
 def _retry_after(headers) -> Optional[int]:
     try:
         value = int(headers.get("Retry-After", "").strip())
@@ -403,3 +439,181 @@ def _json_body(raw: bytes) -> dict:
     except Exception:
         return {}
     return body if isinstance(body, dict) else {}
+
+
+# -- shared sender, direct calls ---------------------------------------------
+
+_shared = None
+_shared_lock = threading.Lock()
+_hostname = None
+
+
+def _host() -> str:
+    global _hostname
+    if _hostname is None:
+        try:
+            _hostname = socket.gethostname()
+        except Exception:
+            _hostname = ""
+    return _hostname
+
+
+def _shared_sender() -> Optional[_Sender]:
+    """The process-wide sender built from LOGDOG_URL and LOGDOG_KEY, or None."""
+    global _shared
+    url = os.environ.get("LOGDOG_URL", "").strip()
+    key = os.environ.get("LOGDOG_KEY", "").strip()
+    if not url or not key:
+        return None
+    with _shared_lock:
+        current = _shared
+        if current is not None and current._id == (url, key) and not current._closed:
+            return current
+        sender = _Sender(url, key)
+        sender._id = (url, key)
+        _shared = sender
+    if current is not None:
+        current.close(0.5)
+    return sender
+
+
+def _close_shared() -> None:
+    sender = _shared
+    if sender is not None:
+        sender.close(5.0)
+
+
+atexit.register(_close_shared)
+
+_LEVELS = ("trace", "debug", "info", "warn", "error", "fatal")
+_LEVEL_ALIASES = {"warning": "warn", "critical": "fatal"}
+
+
+def build_direct_entry(level, message, attrs: dict, host: str,
+                       env: Optional[str]) -> dict:
+    """Build an entry from a direct call. Never raises."""
+    try:
+        name = _text(level).strip().lower()
+        name = _LEVEL_ALIASES.get(name, name)
+        if name not in _LEVELS:
+            name = "info"
+        return _make_entry(name, _text(message), time.time(), attrs, host, env)
+    except Exception:
+        return {"level": "error", "message": "logdog: could not build entry"}
+
+
+def send(level, message, /, **attrs) -> None:
+    """Send one entry straight to Log Dog, with your own fields.
+
+    Goes to Log Dog only (not to the console or the logging module) and is
+    sent whatever the logger's level. Does nothing without LOGDOG_KEY/URL.
+    """
+    try:
+        sender = _shared_sender()
+        if sender is None:
+            return
+        sender.enqueue(build_direct_entry(
+            level, message, attrs, _host(), os.environ.get("LOGDOG_ENV")
+        ))
+    except Exception:
+        pass
+
+
+def trace(message, /, **attrs) -> None:
+    send("trace", message, **attrs)
+
+
+def debug(message, /, **attrs) -> None:
+    send("debug", message, **attrs)
+
+
+def info(message, /, **attrs) -> None:
+    send("info", message, **attrs)
+
+
+def warn(message, /, **attrs) -> None:
+    send("warn", message, **attrs)
+
+
+def error(message, /, **attrs) -> None:
+    send("error", message, **attrs)
+
+
+def fatal(message, /, **attrs) -> None:
+    send("fatal", message, **attrs)
+
+
+def flush(timeout: float = 5.0) -> bool:
+    """Wait until everything queued so far is sent. True if it was."""
+    sender = _shared
+    if sender is None:
+        return True
+    return sender.flush(timeout)
+
+
+# -- logging handler -----------------------------------------------------------
+
+class LogDogHandler(logging.Handler):
+    """Ships logging records to Log Dog. Does nothing without a key and URL."""
+
+    def __init__(self, url: Optional[str] = None, key: Optional[str] = None,
+                 env: Optional[str] = None, level: int = logging.NOTSET,
+                 **sender_options):
+        super().__init__(level)
+        self._env = env if env is not None else os.environ.get("LOGDOG_ENV")
+        self._owns_sender = False
+        if url is None and key is None and not sender_options:
+            self._sender = _shared_sender()
+        else:
+            url = (url if url is not None else os.environ.get("LOGDOG_URL", "")).strip()
+            key = (key if key is not None else os.environ.get("LOGDOG_KEY", "")).strip()
+            self._sender = _Sender(url, key, **sender_options) if url and key else None
+            self._owns_sender = self._sender is not None
+        if self._owns_sender:
+            atexit.register(self.close)
+
+    def emit(self, record) -> None:
+        try:
+            sender = self._sender
+            if sender is None or record.threadName == "logdog-sender":
+                return
+            sender.enqueue(build_entry(record, _host(), self._env))
+        except Exception:
+            pass
+
+    def flush(self) -> None:
+        try:
+            if self._sender is not None:
+                self._sender.flush(5.0)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        try:
+            if self._sender is not None:
+                if self._owns_sender:
+                    self._sender.close(5.0)
+                else:
+                    self._sender.flush(5.0)
+        except Exception:
+            pass
+        super().close()
+
+
+def install(logger: Optional[logging.Logger] = None, level: int = logging.NOTSET,
+            **options) -> Optional[LogDogHandler]:
+    """Add a Log Dog handler to `logger` (the root logger by default).
+
+    Returns the handler, or None (adding nothing) when LOGDOG_KEY or
+    LOGDOG_URL is not set. Safe to call more than once.
+    """
+    if logger is None:
+        logger = logging.getLogger()
+    for existing in logger.handlers:
+        if isinstance(existing, LogDogHandler):
+            return existing
+    handler = LogDogHandler(level=level, **options)
+    if handler._sender is None:
+        return None
+    logger.addHandler(handler)
+    return handler

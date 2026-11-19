@@ -170,6 +170,14 @@ class FakeServer:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def do_GET(self):
+                with outer.lock:
+                    outer.requests.append(Req(self.headers, None, 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
             def log_message(self, *a):
                 pass
 
@@ -367,6 +375,35 @@ class SenderTest(ServerCase):
         time.sleep(0.2)
         self.assertEqual(len(self.server.requests), 0)
 
+    def test_redirect_is_not_followed_so_the_key_stays_home(self):
+        other = FakeServer()
+        self.addCleanup(other.close)
+        self.server.script = [(302, {"Location": other.url + "/v1/logs"}, {})]
+        s = self.sender()
+        s.enqueue(E("a"))
+        self.assertTrue(s.flush(2))
+        self.assertEqual(other.requests, [])
+        self.assertEqual(len(self.server.requests), 1)
+        self.assertEqual(s.dropped, 1)
+
+    def test_queue_byte_cap_drops_oldest(self):
+        s = self.sender(queue_bytes=10_000, flush_interval=30)
+        for i in range(10):
+            s.enqueue({"level": "info", "message": "x" * 3000, "attrs": {"i": i}})
+        self.assertTrue(s.flush(2))
+        sent = [e["attrs"]["i"] for r in self.server.requests for e in r.body]
+        self.assertEqual(sent, [7, 8, 9])
+        self.assertEqual(s.dropped, 7)
+
+    def test_entry_larger_than_max_body_is_dropped(self):
+        s = self.sender(max_body=1000)
+        s.enqueue(E("x" * 5000))
+        s.enqueue(E("ok"))
+        self.assertTrue(s.flush(2))
+        self.assertEqual([e["message"] for r in self.server.requests for e in r.body],
+                         ["ok"])
+        self.assertEqual(s.dropped, 1)
+
     def test_enqueue_never_blocks_while_server_is_slow(self):
         port = free_port()                      # nothing listens: every send fails
         s = logdog._Sender("http://127.0.0.1:%d" % port, "ld_test", flush_interval=0.01)
@@ -376,6 +413,274 @@ class SenderTest(ServerCase):
             for i in range(20000):
                 s.enqueue(E(str(i)))
             self.assertLess(time.monotonic() - t, 2.0)
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+@contextlib.contextmanager
+def env(**kw):
+    old = {k: os.environ.get(k) for k in kw}
+    try:
+        for k, v in kw.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+class HandlerCase(ServerCase):
+    def logger(self, name, level=logging.INFO):
+        lg = logging.getLogger(name)
+        lg.setLevel(level)
+        lg.propagate = False
+        self.addCleanup(lambda: [lg.removeHandler(h) for h in list(lg.handlers)])
+        return lg
+
+    def handler(self):
+        h = logdog.LogDogHandler(self.server.url, "ld_test", flush_interval=0.05,
+                                 backoff_start=0.05, backoff_cap=0.2)
+        self.addCleanup(h.close)
+        return h
+
+    def messages(self):
+        return [e["message"] for r in self.server.requests for e in r.body]
+
+
+class HandlerTest(HandlerCase):
+    def test_install_without_key_is_a_silent_noop(self):
+        lg = self.logger("noop")
+        cap = Capture()
+        lg.addHandler(cap)
+        with env(LOGDOG_KEY=None, LOGDOG_URL=None):
+            self.assertIsNone(logdog.install(lg))
+            lg.error("nothing happens")
+        self.assertEqual(lg.handlers, [cap])
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_install_without_url_is_a_silent_noop(self):
+        lg = self.logger("nourl")
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=None):
+            self.assertIsNone(logdog.install(lg))
+        self.assertEqual(lg.handlers, [])
+
+    def test_install_ships_existing_log_calls(self):
+        lg = self.logger("ship")
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url, LOGDOG_ENV="dev"):
+            h = logdog.install(lg, flush_interval=0.05)
+        self.addCleanup(h.close)
+        lg.info("checkout started", extra={"order_id": 8812})
+        lg.debug("hidden")
+        h.flush()
+        body = self.server.requests[0].body
+        self.assertEqual(len(body), 1)
+        self.assertEqual(
+            (body[0]["message"], body[0]["attrs"], body[0]["env"]),
+            ("checkout started", {"order_id": 8812}, "dev"),
+        )
+        self.assertEqual(body[0]["host"], socket.gethostname()[:128])
+
+    def test_install_twice_adds_one_handler(self):
+        lg = self.logger("twice")
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url):
+            a = logdog.install(lg)
+            b = logdog.install(lg)
+        self.assertIs(a, b)
+        self.assertEqual(len(lg.handlers), 1)
+
+    def test_handler_level_filters(self):
+        lg = self.logger("lvl")
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url):
+            h = logdog.install(lg, level=logging.ERROR, flush_interval=0.05)
+        self.addCleanup(h.close)
+        lg.info("skipped")
+        lg.error("kept")
+        h.flush()
+        self.assertEqual(self.messages(), ["kept"])
+
+    def test_handler_without_key_does_nothing(self):
+        with env(LOGDOG_KEY=None, LOGDOG_URL=None):
+            h = logdog.LogDogHandler()
+        lg = self.logger("nokey")
+        lg.addHandler(h)
+        lg.error("x")
+        h.flush()
+        h.close()
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_records_from_the_sender_thread_are_ignored(self):
+        h = self.handler()
+        r = logging.makeLogRecord(
+            {"msg": "x", "levelno": 20, "threadName": "logdog-sender"}
+        )
+        h.emit(r)
+        h.flush()
+        self.assertEqual(self.server.requests, [])
+
+    def test_emit_never_raises(self):
+        h = self.handler()
+        h.emit("not a record")
+        h.emit(None)
+
+    def test_exit_flushes(self):
+        code = ("import logging, logdog; logging.getLogger().setLevel(20); "
+                "logdog.install(); logging.info('bye')")
+        subprocess.run([sys.executable, "-c", code], cwd=HERE, check=True, timeout=10,
+                       env=dict(os.environ, LOGDOG_KEY="ld_test",
+                                LOGDOG_URL=self.server.url))
+        self.assertEqual(self.server.requests[0].body[0]["message"], "bye")
+
+    def test_exit_flushes_direct_calls(self):
+        code = "import logdog; logdog.info('direct bye', n=1)"
+        subprocess.run([sys.executable, "-c", code], cwd=HERE, check=True, timeout=10,
+                       env=dict(os.environ, LOGDOG_KEY="ld_test",
+                                LOGDOG_URL=self.server.url))
+        self.assertEqual(self.server.requests[0].body[0]["message"], "direct bye")
+
+    def test_exit_with_server_down_returns_within_6_seconds(self):
+        code = "import logging, logdog; logdog.install(); logging.error('x')"
+        t = time.monotonic()
+        subprocess.run([sys.executable, "-c", code], cwd=HERE, timeout=15,
+                       stderr=subprocess.DEVNULL,
+                       env=dict(os.environ, LOGDOG_KEY="ld_test",
+                                LOGDOG_URL="http://127.0.0.1:9"))
+        self.assertLess(time.monotonic() - t, 6.5)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork")
+    def test_child_after_fork_sends_its_own_logs(self):
+        h = self.handler()
+        lg = self.logger("fork")
+        lg.addHandler(h)
+        lg.info("parent")
+        h.flush()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                lg.info("child")
+                h.flush()
+            finally:
+                os._exit(0)
+        os.waitpid(pid, 0)
+        self.assertEqual(sorted(self.messages()), ["child", "parent"])
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork")
+    def test_child_does_not_resend_what_the_parent_queued(self):
+        h = logdog.LogDogHandler(self.server.url, "ld_test", flush_interval=0.5)
+        self.addCleanup(h.close)
+        lg = self.logger("fork2")
+        lg.addHandler(h)
+        lg.info("parent queued")              # still in the queue at fork time
+        pid = os.fork()
+        if pid == 0:
+            try:
+                lg.info("child")
+                h.flush()
+            finally:
+                os._exit(0)
+        os.waitpid(pid, 0)
+        h.flush()
+        self.assertEqual(sorted(self.messages()), ["child", "parent queued"])
+
+    def test_many_threads_and_emit_after_close(self):
+        h = self.handler()
+        lg = self.logger("mt")
+        lg.addHandler(h)
+        ts = [threading.Thread(target=lambda: [lg.info("m") for _ in range(200)])
+              for _ in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        h.flush()
+        self.assertEqual(sum(len(r.body) for r in self.server.requests), 1600)
+        h.close()
+        lg.info("late")
+
+
+class DirectTest(HandlerCase):
+    def test_direct_call_without_install(self):
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url, LOGDOG_ENV="dev"):
+            logdog.error("payment failed", order_id=8812, err="card_declined",
+                         trace_id="4f1c9a")
+            self.assertTrue(logdog.flush())
+        e = self.server.requests[0].body[0]
+        self.assertEqual(
+            (e["level"], e["message"], e["trace_id"], e["env"]),
+            ("error", "payment failed", "4f1c9a", "dev"),
+        )
+        self.assertEqual(e["attrs"], {"order_id": 8812, "err": "card_declined"})
+        self.assertRegex(e["ts"], r"Z$")
+        self.assertEqual(e["host"], socket.gethostname()[:128])
+
+    def test_every_shorthand_and_send(self):
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url):
+            for name in ("trace", "debug", "info", "warn", "error", "fatal"):
+                getattr(logdog, name)(name)
+            logdog.send("warning", "sent", level=3, message="m")
+            logdog.flush()
+        got = [(e["level"], e["message"]) for r in self.server.requests for e in r.body]
+        self.assertEqual(got[:6], [(n, n) for n in
+                                   ("trace", "debug", "info", "warn", "error", "fatal")])
+        self.assertEqual(got[6], ("warn", "sent"))
+        last = [e for r in self.server.requests for e in r.body][6]
+        self.assertEqual(last["attrs"], {"level": 3, "message": "m"})
+
+    def test_direct_and_installed_share_one_sender(self):
+        lg = self.logger("share", logging.WARNING)
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url):
+            h = logdog.install(lg)
+            lg.warning("via logging")
+            logdog.debug("via direct")
+            h.flush()
+            self.assertIs(h._sender, logdog._shared_sender())
+        self.assertEqual(sorted(self.messages()), ["via direct", "via logging"])
+
+    def test_direct_does_not_reach_the_logger(self):
+        cap = Capture()
+        root = logging.getLogger()
+        root.addHandler(cap)
+        self.addCleanup(root.removeHandler, cap)
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url):
+            logdog.info("quiet")
+            logdog.flush()
+        self.assertEqual(cap.records, [])
+        self.assertEqual(self.messages(), ["quiet"])
+
+    def test_levels_and_aliases(self):
+        cases = [("trace", "trace"), ("WARN", "warn"), ("warning", "warn"),
+                 ("critical", "fatal"), ("nonsense", "info"), (None, "info")]
+        for given, sent in cases:
+            self.assertEqual(
+                logdog.build_direct_entry(given, "x", {}, "h", None)["level"], sent
+            )
+
+    def test_direct_without_key_is_silent_noop(self):
+        with env(LOGDOG_KEY=None, LOGDOG_URL=None):
+            logdog.error("x", a=object())
+            self.assertTrue(logdog.flush())
+        self.assertEqual(self.err.getvalue(), "")
+
+    def test_direct_limits_and_odd_values_never_raise(self):
+        e = logdog.build_direct_entry("info", "é" * 5000, {"big": "a" * 70000}, "h", None)
+        self.assertLessEqual(len(e["message"].encode()), 8192)
+        self.assertEqual(e["attrs"], {"_logdog_dropped": "attrs_too_large"})
+        e = logdog.build_direct_entry("info", 12345, {"o": object()}, "h", None)
+        self.assertEqual(e["message"], "12345")
+        self.assertIsInstance(e["attrs"]["o"], str)
 
 
 if __name__ == "__main__":
