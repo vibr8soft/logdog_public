@@ -568,3 +568,16 @@ func TestSendWithoutKey(t *testing.T) {
 	eq(t, h.Dropped(), 0)
 	eq(t, errOut.String(), "")
 }
+
+func TestCloseWithoutDeadlineIsBounded(t *testing.T) {
+	old := closeWait
+	closeWait = 200 * time.Millisecond
+	defer func() { closeWait = old }()
+	lg, h := live(t, "http://127.0.0.1:9", nil, Options{})
+	lg.Info("a")
+	start := time.Now()
+	err := h.Close(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 2*time.Second {
+		t.Fatalf("err %v after %v", err, time.Since(start))
+	}
+}

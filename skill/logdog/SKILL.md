@@ -40,7 +40,7 @@ If the user only asks to improve what their entries contain and the sender is al
 
    In Go, `Close` must run before the program exits or the last entries are lost. A `defer` in `main` does not run on `os.Exit`, `log.Fatal` or a signal; call `h.Close` on those paths too. `Close` returns an error, is safe to call more than once, and stops waiting when its context ends: in a program that must exit promptly, pass a context with a timeout of about 5 seconds.
 5. **Add the variables** `LOGDOG_KEY=`, `LOGDOG_URL=` and `LOGDOG_ENV=` with empty values to the project's env example file (`.env.example`, or the one it has; with none, list them in the README instead). `LOGDOG_ENV` is optional (`prod`, `staging`, …). The sender reads the process environment; it does not read `.env` files itself. Never write a real key into any file and never print one.
-6. **Test it.** First run the project with the variables unset and confirm it builds and behaves as before. Then, if `LOGDOG_KEY` and `LOGDOG_URL` are set in the shell (check with `test -n "$LOGDOG_KEY"`, never by printing it), run the app's quickest path that logs one line (or `python3 -c "import logging, logdog; logdog.install(); logging.error('logdog test')"` beside the file) and report the result: a `logdog:` line on stderr means a problem; with none, ask the user to confirm the entry in the dashboard's Live tail. If they are not set, tell the user to set them. `LOGDOG_URL` is the Log Dog origin, for example `https://logs.example.com`. The key comes from the Log Dog dashboard: Apps, create an app, copy the key (shown once).
+6. **Test it.** First run the project with the variables unset and confirm it builds and behaves as before. Then, if `LOGDOG_KEY` and `LOGDOG_URL` are set in the shell (check with `test -n "$LOGDOG_KEY"`, never by printing it), send one test entry and report the result. Python, beside the file: `python3 -c "import logdog; logdog.error('logdog test'); print('sent' if logdog.flush() else 'not sent')"`. Go: run the app's quickest path that logs one line and exits through `h.Close`. A `logdog:` line on stderr, or `not sent`, means a problem (wrong key, wrong URL, or a URL without `https://`). With neither, ask the user to confirm the entry in the dashboard's Live tail. If they are not set, tell the user to set them. `LOGDOG_URL` is the Log Dog origin, for example `https://logs.example.com`. The key comes from the Log Dog dashboard: Apps, create an app, copy the key (shown once).
 7. **Review the project's log calls** and propose fields worth adding, using the rules below. Propose; do not apply unasked.
 
 ## Entry format
@@ -105,7 +105,7 @@ In Python, `extra` keys must not reuse a `logging` record name (`message`, `msg`
 - Reports its own problems on stderr only, at most one `logdog:` line a minute, never through the logger.
 - Does nothing, silently, when `LOGDOG_KEY` or `LOGDOG_URL` is not set.
 - Never follows a redirect: `LOGDOG_URL` must be the final origin (use `https://` if the site redirects to it).
-- Python flushes at exit by itself, waiting at most 5 seconds; Go needs `h.Close(ctx)`.
+- Python flushes at a normal exit by itself, waiting at most 5 seconds (not when the process is killed); Go needs `h.Close(ctx)`, which waits at most 5 seconds unless the context says otherwise.
 
 ## Not supported yet
 

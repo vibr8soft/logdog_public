@@ -29,7 +29,7 @@ import logdog
 logdog.install()
 ```
 
-Everything `logging` emits is now also sent to Log Dog. Your existing handlers are untouched. Extra fields become searchable attrs:
+Everything `logging` emits is now also sent to Log Dog. Your existing handlers are untouched. The logger's level decides what is sent: Python's default is `WARNING`, so set the level to `INFO` to send info lines. Extra fields become searchable attrs:
 
 ```python
 logging.info("checkout started", extra={"order_id": 8812, "trace_id": "4f1c9a"})
@@ -64,7 +64,7 @@ Every record still reaches the wrapped handler. To send an entry with your own f
 h.Send("error", "payment failed", map[string]any{"order_id": 8812, "err": "card_declined"})
 ```
 
-Call `h.Close` before the program exits, or the last entries are lost.
+Call `h.Close` before the program exits, or the last entries are lost. It waits for the context you pass, or at most 5 seconds when the context has no deadline.
 
 ## Claude Code skill
 
@@ -82,7 +82,7 @@ Then, in a project, ask Claude Code: "add Log Dog to this project".
 - Holds up to 10,000 entries (16 MB) in memory while it cannot send, dropping the oldest first.
 - Cuts anything over Log Dog's limits, so one oversized entry never refuses a batch.
 - Reports its own problems on stderr only, at most one `logdog:` line a minute.
-- Never follows a redirect, so the API key is only ever sent to `LOGDOG_URL`.
+- Never follows a redirect, so a redirect cannot forward the API key to another address.
 
 A direct call (`logdog.error(…)`, `h.Send(…)`) goes to Log Dog only, not to the console, and is sent whatever the logger's level.
 

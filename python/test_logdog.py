@@ -116,6 +116,20 @@ class BuildEntryTest(unittest.TestCase):
         e = logdog.build_entry(rec(logging.INFO, "x", d=d), "h", None)
         self.assertEqual(e["attrs"], {"_logdog_dropped": "attrs_too_deep"})
 
+    def test_empty_message_gets_a_placeholder(self):
+        e = logdog.build_entry(rec(logging.INFO, ""), "h", None)
+        self.assertEqual(e["message"], "(empty)")
+        e = logdog.build_direct_entry("info", "", {}, "h", None)
+        self.assertEqual(e["message"], "(empty)")
+
+    def test_integers_the_server_refuses_become_strings(self):
+        e = logdog.build_entry(
+            rec(logging.INFO, "x", big=2**70, neg=-2**63 - 1, top=2**64 - 1, low=-2**63),
+            "h", None,
+        )
+        self.assertEqual(e["attrs"], {"big": str(2**70), "neg": str(-2**63 - 1),
+                                      "top": 2**64 - 1, "low": -2**63})
+
     def test_host_env_trace_cut(self):
         e = logdog.build_entry(
             rec(logging.INFO, "x", trace_id="t" * 300), "h" * 200, "e" * 200
@@ -239,6 +253,23 @@ class SenderTest(ServerCase):
         s.enqueue(E("a"))
         time.sleep(0.5)
         self.assertEqual(len(self.server.requests), 1)
+
+    def test_second_entry_after_first_batch_is_sent_on_the_interval(self):
+        s = self.sender()
+        s.enqueue(E("first"))
+        time.sleep(0.4)
+        s.enqueue(E("second"))
+        time.sleep(0.6)
+        sent = [e["message"] for r in self.server.requests for e in r.body]
+        self.assertEqual(sent, ["first", "second"])
+
+    def test_url_without_scheme_is_reported_on_stderr(self):
+        s = logdog._Sender("logs.example.invalid", "ld_test", flush_interval=0.05,
+                           backoff_start=0.05, backoff_cap=0.2)
+        self.addCleanup(s.close, 0.1)
+        s.enqueue(E("a"))
+        time.sleep(0.4)
+        self.assertIn("logdog: ", self.err.getvalue())
 
     def test_batch_size_and_body_cap(self):
         s = self.sender(batch_size=3, max_body=10_000)
@@ -445,6 +476,10 @@ class Capture(logging.Handler):
         self.records.append(record)
 
 
+def _mp_child(method):
+    logdog.error("child " + method)
+
+
 class HandlerCase(ServerCase):
     def logger(self, name, level=logging.INFO):
         lg = logging.getLogger(name)
@@ -596,6 +631,19 @@ class HandlerTest(HandlerCase):
         os.waitpid(pid, 0)
         h.flush()
         self.assertEqual(sorted(self.messages()), ["child", "parent queued"])
+
+    def test_short_lived_multiprocessing_child_delivers_its_logs(self):
+        import multiprocessing
+        methods = [m for m in ("fork", "spawn")
+                   if m in multiprocessing.get_all_start_methods()]
+        with env(LOGDOG_KEY="ld_test", LOGDOG_URL=self.server.url):
+            for method in methods:
+                p = multiprocessing.get_context(method).Process(
+                    target=_mp_child, args=(method,))
+                p.start()
+                p.join(15)
+                self.assertEqual(p.exitcode, 0)
+        self.assertEqual(sorted(self.messages()), sorted("child " + m for m in methods))
 
     def test_many_threads_and_emit_after_close(self):
         h = self.handler()

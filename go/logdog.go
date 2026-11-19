@@ -46,6 +46,9 @@ import (
 
 const userAgent = "logdog-go/0.1"
 
+// closeWait bounds Close when its context has no deadline.
+var closeWait = 5 * time.Second
+
 const (
 	maxMessage    = 8192
 	maxAttrsBytes = 65536
@@ -214,6 +217,7 @@ func (h *Handler) Send(level, message string, attrs map[string]any) {
 }
 
 // Flush waits until everything queued so far is sent or dropped, or ctx ends.
+// While Log Dog is unreachable that can be a long time: pass a ctx with a deadline.
 func (h *Handler) Flush(ctx context.Context) error {
 	if h.c.snd == nil {
 		return nil
@@ -222,7 +226,9 @@ func (h *Handler) Flush(ctx context.Context) error {
 }
 
 // Close flushes, then stops the background sender. Call it before the program
-// exits. Records logged afterwards still reach the wrapped handler.
+// exits. Records logged afterwards still reach the wrapped handler. It waits
+// until ctx ends, or 5 seconds when ctx has no deadline, so a program never
+// hangs at exit because Log Dog is unreachable.
 func (h *Handler) Close(ctx context.Context) error {
 	if h.c.snd == nil {
 		return nil
@@ -304,6 +310,9 @@ func (h *Handler) buildEntry(r slog.Record) entry {
 // finish turns a level, message and attrs map into an entry within the limits.
 func (c *core) finish(level, message string, at time.Time, attrs map[string]any) entry {
 	e := entry{Level: level, Message: cut(clean(message), maxMessage), Host: c.host, Env: c.env}
+	if e.Message == "" {
+		e.Message = "(empty)" // the server refuses an empty message
+	}
 	if !at.IsZero() {
 		e.TS = at.UTC().Format(time.RFC3339Nano)
 	}
@@ -431,15 +440,17 @@ func plainAny(x any) any {
 	case string:
 		return clean(t)
 	}
+	// Never print the value itself on failure: fmt recurses without end on a
+	// self-referencing map or slice, and that crash cannot be recovered.
 	raw, err := json.Marshal(x)
 	if err != nil {
-		return clean(fmt.Sprint(x))
+		return fmt.Sprintf("<%T: not serializable>", x)
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var out any
 	if dec.Decode(&out) != nil {
-		return clean(fmt.Sprint(x))
+		return fmt.Sprintf("<%T: not serializable>", x)
 	}
 	return out
 }
@@ -614,6 +625,11 @@ func (s *sender) flush(ctx context.Context) error {
 func (s *sender) close(ctx context.Context) error {
 	var err error
 	s.once.Do(func() {
+		if _, bounded := ctx.Deadline(); !bounded {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, closeWait)
+			defer cancel()
+		}
 		err = s.flush(ctx)
 		s.mu.Lock()
 		s.closed = true

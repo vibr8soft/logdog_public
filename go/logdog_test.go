@@ -345,3 +345,28 @@ func TestEnvVarsAreRead(t *testing.T) {
 		t.Fatal("LOGDOG_ENV not used")
 	}
 }
+
+func TestCyclicValueDoesNotCrash(t *testing.T) {
+	lg, c, h := newTest(t, nil)
+	m := map[string]any{}
+	m["self"] = m
+	lg.Info("via slog", "m", m)
+	h.Send("info", "via send", map[string]any{"m": m})
+	got := c.entries()
+	if len(got) != 2 || got[0].Message != "via slog" || got[1].Message != "via send" {
+		t.Fatalf("got %+v", got)
+	}
+	if _, ok := got[0].Attrs["m"].(string); !ok {
+		t.Fatalf("cyclic value should become a string: %T", got[0].Attrs["m"])
+	}
+}
+
+func TestEmptyMessageGetsAPlaceholder(t *testing.T) {
+	lg, c, h := newTest(t, nil)
+	lg.Info("", "k", 1)
+	h.Send("info", "", nil)
+	got := c.entries()
+	if got[0].Message != "(empty)" || got[1].Message != "(empty)" {
+		t.Fatalf("got %q and %q", got[0].Message, got[1].Message)
+	}
+}

@@ -10,7 +10,9 @@ optionally LOGDOG_ENV. Then, once, where your program starts:
     logdog.install()
 
 Everything the standard ``logging`` module emits is now also sent to Log Dog;
-your existing handlers are untouched. Extra fields become searchable attrs:
+your existing handlers are untouched. The logger's level decides what is sent:
+Python's default is WARNING, so set the level to INFO to send info lines.
+Extra fields become searchable attrs:
 
     logging.info("checkout started", extra={"order_id": 8812, "trace_id": "4f1c9a"})
 
@@ -93,8 +95,11 @@ def _text(v) -> str:
 
 def _jsonable(v, depth, path):
     """Copy a value into plain JSON types; anything else becomes a string."""
-    if v is None or isinstance(v, (bool, int)):
+    if v is None or isinstance(v, bool):
         return v
+    if isinstance(v, int):
+        # The server refuses integers outside the signed/unsigned 64-bit range.
+        return v if -(2 ** 63) <= v < 2 ** 64 else str(v)
     if isinstance(v, float):
         return v if math.isfinite(v) else str(v)
     if isinstance(v, str):
@@ -139,7 +144,7 @@ def _shape_attrs(attrs: dict) -> Optional[dict]:
 def _make_entry(level, message, created, attrs, host, env) -> dict:
     entry = {
         "level": level,
-        "message": _cut(message, MAX_MESSAGE),
+        "message": _cut(message, MAX_MESSAGE) or "(empty)",
         "ts": datetime.fromtimestamp(created, timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ"
         ),
@@ -268,7 +273,8 @@ class _Sender:
                                    or self._queued + len(raw) > self._queue_bytes):
                 self._queued -= len(self._queue.popleft())
                 self.dropped += 1
-            if not self._queue:
+            first = not self._queue
+            if first:
                 self._oldest = time.monotonic()
             self._queue.append(raw)
             self._queued += len(raw)
@@ -277,7 +283,8 @@ class _Sender:
                     target=self._run, name="logdog-sender", daemon=True
                 )
                 self._thread.start()
-            if len(self._queue) >= self._batch_size:
+                _flush_at_child_exit(self)
+            if first or len(self._queue) >= self._batch_size:
                 self._cond.notify_all()
 
     def flush(self, timeout: float) -> bool:
@@ -329,8 +336,9 @@ class _Sender:
                 self._inflight = True
             try:
                 self._deliver(batch)
-            except Exception:
+            except Exception as e:
                 self.dropped += len(batch)
+                self._warn("batch dropped: %s" % type(e).__name__)
             finally:
                 with cond:
                     self._inflight = False
@@ -404,13 +412,13 @@ class _Sender:
 
     def _post(self, batch):
         data = gzip.compress(b"[" + b",".join(batch) + b"]")
-        req = urllib.request.Request(self._url, data=data, method="POST", headers={
-            "Authorization": "Bearer " + self._key,
-            "Content-Type": "application/json",
-            "Content-Encoding": "gzip",
-            "User-Agent": "logdog-python/" + __version__,
-        })
         try:
+            req = urllib.request.Request(self._url, data=data, method="POST", headers={
+                "Authorization": "Bearer " + self._key,
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip",
+                "User-Agent": "logdog-python/" + __version__,
+            })
             with _opener.open(req, timeout=self._timeout) as resp:
                 return resp.status, resp.headers, _json_body(resp.read(65536))
         except urllib.error.HTTPError as e:
@@ -451,6 +459,18 @@ def _after_fork_in_child():
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def _flush_at_child_exit(sender) -> None:
+    """A multiprocessing child exits without running atexit hooks: flush there too."""
+    try:
+        mp = sys.modules.get("multiprocessing")
+        if mp is None or mp.parent_process() is None:
+            return
+        from multiprocessing import util
+        util.Finalize(sender, sender.close, args=(5.0,), exitpriority=10)
+    except Exception:
+        pass
 
 
 def _retry_after(headers) -> Optional[int]:
