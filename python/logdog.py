@@ -1,3 +1,31 @@
+"""Ship a program's logs to Log Dog.
+
+One file, standard library only: copy it next to your code.
+Source: https://github.com/vibr8soft/logdog_public
+
+Set LOGDOG_URL (your Log Dog origin) and LOGDOG_KEY (the app's API key), and
+optionally LOGDOG_ENV. Then, once, where your program starts:
+
+    import logdog
+    logdog.install()
+
+Everything the standard ``logging`` module emits is now also sent to Log Dog;
+your existing handlers are untouched. Extra fields become searchable attrs:
+
+    logging.info("checkout started", extra={"order_id": 8812, "trace_id": "4f1c9a"})
+
+To send an entry with your own fields, bypassing ``logging``:
+
+    logdog.error("payment failed", order_id=8812, err="card_declined")
+    logdog.send("info", "checkout started", cart={"items": 3})
+
+Without a key or URL every call does nothing, so development machines and
+tests need no setup. Entries are sent in the background in gzip batches;
+logging never blocks and never fails because of Log Dog. When it cannot be
+reached, up to 10,000 entries wait in memory and the oldest are dropped first.
+The sender reports its own problems on stderr, at most one line a minute.
+"""
+
 import atexit
 import collections
 import gzip
