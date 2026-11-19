@@ -308,10 +308,8 @@ func TestEnabled(t *testing.T) {
 func TestNoKeyIsPassThrough(t *testing.T) {
 	t.Setenv("LOGDOG_KEY", "")
 	t.Setenv("LOGDOG_URL", "http://x.invalid")
-	var buf, errOut bytes.Buffer
-	old := stderr
-	stderr = &errOut
-	defer func() { stderr = old }()
+	var buf bytes.Buffer
+	errOut := captureStderr(t)
 	h := New(slog.NewTextHandler(&buf, nil))
 	slog.New(h).Info("hello")
 	if !strings.Contains(buf.String(), "hello") {
@@ -320,7 +318,7 @@ func TestNoKeyIsPassThrough(t *testing.T) {
 	if h.c.sink != nil {
 		t.Fatal("sink should be nil without a key")
 	}
-	if errOut.Len() != 0 {
+	if errOut.String() != "" {
 		t.Fatalf("stderr: %s", errOut.String())
 	}
 	alone := New(nil)
