@@ -1,6 +1,12 @@
+<p align="center">
+  <a href="https://logdog.vibr8lab.work"><img src="assets/logo.png" alt="Log Dog logo: a dachshund in sunglasses lounging in a hot dog bun on a wooden log" width="220"></a>
+</p>
+
 # Log Dog senders
 
-One file per stack that ships your program's logs to Log Dog. This is v1, before official packages: copy the file into your project. Each file uses the standard library only.
+[Log Dog](https://logdog.vibr8lab.work) is a log service: your programs send structured JSON logs over plain HTTP, and you search inside every field, tail them live, and get an email when something goes wrong.
+
+This repository holds the senders: one file per stack that ships your program's logs to Log Dog. This is v1, before official packages: copy the file into your project. Each file uses the standard library only.
 
 - **Python:** [`python/logdog.py`](python/logdog.py), a handler for the standard `logging` module (Python 3.9+).
 - **Go:** [`go/logdog.go`](go/logdog.go), a handler for `log/slog` (Go 1.21+).
